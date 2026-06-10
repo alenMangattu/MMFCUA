@@ -9,16 +9,24 @@ import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import agent_loop
+import tools
 from conversation import Convo
 from memory import (
+    MEMORY_PROMPT_PATH,
     RunRecorder,
     make_memory,
     normalize_review,
+    render_memory_prompt,
     save_memory,
     verification_passed,
+)
+from memory_search import (
+    MemoryVectorStore,
+    guidance_message,
+    memory_save_decision,
 )
 from tools import tools_json_for_prompt
 
@@ -66,6 +74,281 @@ def successful_review() -> dict:
 
 
 class MemoryTests(unittest.TestCase):
+    def test_duplicate_exact_task_memory_is_not_saved_again(self) -> None:
+        candidate = {
+            "task": "open chrome",
+            "playbook": {
+                "learned_target_mappings": [
+                    {
+                        "requested": "Chrome",
+                        "effective": "Chromium",
+                    }
+                ]
+            },
+        }
+        existing = [
+            {
+                "match_type": "exact_task",
+                "task": "open chrome",
+                "playbook": {
+                    "learned_target_mappings": [
+                        {
+                            "requested": "Chrome / Google Chrome",
+                            "effective": "Chromium",
+                        }
+                    ]
+                },
+            }
+        ]
+
+        should_save, reason = memory_save_decision(candidate, existing)
+
+        self.assertFalse(should_save)
+        self.assertIn("already has", reason)
+
+    def test_new_target_mapping_is_saved_for_exact_task(self) -> None:
+        candidate = {
+            "task": "open browser",
+            "playbook": {
+                "learned_target_mappings": [
+                    {
+                        "requested": "browser",
+                        "effective": "Firefox",
+                    }
+                ]
+            },
+        }
+        existing = [
+            {
+                "match_type": "exact_task",
+                "task": "open browser",
+                "playbook": {
+                    "learned_target_mappings": [
+                        {
+                            "requested": "browser",
+                            "effective": "Chromium",
+                        }
+                    ]
+                },
+            }
+        ]
+
+        should_save, reason = memory_save_decision(candidate, existing)
+
+        self.assertTrue(should_save)
+        self.assertIn("new target mapping", reason)
+
+    def test_direct_type_then_enter_gets_automatic_settle_wait(self) -> None:
+        actions = [
+            {"tool": "type_text", "arguments": {"text": "Chromium"}},
+            {"tool": "key_press", "arguments": {"key": "Enter"}},
+        ]
+
+        with (
+            patch("tools.call_tool", return_value={}),
+            patch("tools.time.sleep") as sleep_mock,
+        ):
+            results = tools.run_actions_safe(actions)
+
+        sleep_mock.assert_called_once_with(0.8)
+        self.assertEqual(
+            results[1]["automatic_wait_before"]["seconds"],
+            0.8,
+        )
+
+    def test_explicit_wait_prevents_duplicate_type_settle_wait(self) -> None:
+        actions = [
+            {"tool": "type_text", "arguments": {"text": "Chromium"}},
+            {"tool": "wait", "arguments": {"seconds": 1}},
+            {"tool": "key_press", "arguments": {"key": "Enter"}},
+        ]
+
+        with (
+            patch("tools.call_tool", return_value={}),
+            patch("tools.time.sleep") as sleep_mock,
+        ):
+            results = tools.run_actions_safe(actions)
+
+        sleep_mock.assert_not_called()
+        self.assertNotIn("automatic_wait_before", results[2])
+
+    def test_type_text_uses_human_readable_default_interval(self) -> None:
+        fake_pg = SimpleNamespace(write=MagicMock())
+
+        with patch("tools._pyautogui", return_value=fake_pg):
+            result = tools.type_text("Chromium")
+
+        fake_pg.write.assert_called_once_with("Chromium", interval=0.02)
+        self.assertEqual(result["interval"], 0.02)
+
+    def test_mouse_click_glides_before_clicking(self) -> None:
+        events = []
+
+        class FakePyAutoGUI:
+            easeInOutQuad = object()
+
+            def position(self):
+                return SimpleNamespace(x=0, y=0)
+
+            def moveTo(self, x, y, **kwargs):
+                events.append(("move", x, y, kwargs))
+
+            def click(self, **kwargs):
+                events.append(("click", kwargs))
+
+        with patch("tools._pyautogui", return_value=FakePyAutoGUI()):
+            result = tools.mouse_click("left", 900, 450)
+
+        self.assertEqual(events[0][0], "move")
+        self.assertEqual(events[1], ("click", {"button": "left"}))
+        self.assertGreater(events[0][3]["duration"], 0)
+        self.assertIn("tween", events[0][3])
+        self.assertEqual(result["movement_duration"], events[0][3]["duration"])
+
+    def test_longer_mouse_moves_take_longer(self) -> None:
+        short = tools._movement_duration(0, 0, 100, 0)
+        long = tools._movement_duration(0, 0, 1000, 0)
+
+        self.assertGreater(long, short)
+        self.assertGreaterEqual(short, 0.12)
+        self.assertLessEqual(long, 0.7)
+
+    def test_memory_prompt_is_loaded_from_jinja_template(self) -> None:
+        rendered = render_memory_prompt()
+
+        self.assertTrue(MEMORY_PROMPT_PATH.exists())
+        self.assertIn("You verify and distill", rendered)
+        self.assertIn('"learned_target_mappings"', rendered)
+
+    def test_no_change_observation_forbids_repeated_blocked_clicks(self) -> None:
+        text = agent_loop._observe_text(
+            task="open chrome",
+            step=3,
+            previous_reply={
+                "reason": "Click Chromium.",
+                "actions": [
+                    {
+                        "tool": "mouse_double_click",
+                        "arguments": {"button": "left", "x": 2000, "y": 500},
+                    }
+                ],
+                "done": False,
+            },
+            tool_results=[],
+            shot={"width": 3456, "height": 2234},
+            mouse={"x": 2000, "y": 500},
+            screen_change={"changed": False, "mean_delta": 0.02},
+        )
+        observation = json.loads(text)
+
+        self.assertIn("Do not repeat", observation["last_action_outcome"])
+        self.assertIn("modal", observation["last_action_outcome"])
+        self.assertIn("not actionable through a modal", observation["instruction"])
+
+    def test_vector_store_ranks_semantically_matching_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            memories = root / "memories"
+            memories.mkdir()
+            chrome_memory = {
+                "run_id": "chrome-run",
+                "task": "open chrome",
+                "verification": {"success": True, "confidence": 0.9},
+                "playbook": {
+                    "task_signature": "Open the Chrome-family browser",
+                    "applicability": "Use when Chrome means installed Chromium.",
+                    "learned_target_mappings": [
+                        {
+                            "requested": "Chrome",
+                            "effective": "Chromium",
+                            "relationship": "installed substitute",
+                        }
+                    ],
+                    "preferred_plan": [],
+                    "fallbacks": [],
+                    "environment_facts": [],
+                },
+            }
+            calculator_memory = {
+                "run_id": "calculator-run",
+                "task": "open calculator",
+                "verification": {"success": True, "confidence": 0.9},
+                "playbook": {
+                    "task_signature": "Open Calculator",
+                    "applicability": "Use for arithmetic tasks.",
+                    "learned_target_mappings": [],
+                    "preferred_plan": [],
+                    "fallbacks": [],
+                    "environment_facts": [],
+                },
+            }
+            (memories / "chrome.json").write_text(json.dumps(chrome_memory))
+            (memories / "calculator.json").write_text(json.dumps(calculator_memory))
+
+            calls = []
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                calls.append(list(texts))
+                vectors = []
+                for text in texts:
+                    lowered = text.lower()
+                    if "chrome" in lowered or "chromium" in lowered:
+                        vectors.append([1.0, 0.0])
+                    else:
+                        vectors.append([0.0, 1.0])
+                return vectors
+
+            store = MemoryVectorStore(
+                memories_dir=memories,
+                index_path=root / "index.sqlite3",
+                embed_function=embed,
+            )
+            first = store.search("please open chrome", minimum_score=0.8)
+            second = store.search("please open chrome", minimum_score=0.8)
+
+            self.assertEqual([match["run_id"] for match in first], ["chrome-run"])
+            self.assertEqual(second[0]["run_id"], "chrome-run")
+            self.assertEqual(first[0]["match_type"], "exact_task")
+            self.assertEqual(len(calls), 2)
+            self.assertIn("retrieved_memory_guidance", guidance_message(first))
+
+    def test_exact_task_memory_bypasses_vector_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            memories = root / "memories"
+            memories.mkdir()
+            memory = {
+                "run_id": "chrome-run",
+                "task": "open chrome",
+                "verification": {"success": True, "confidence": 0.96},
+                "playbook": {
+                    "task_signature": "Open a browser",
+                    "applicability": "Browser requests",
+                    "learned_target_mappings": [],
+                    "preferred_plan": [],
+                    "fallbacks": [],
+                    "environment_facts": [],
+                },
+            }
+            (memories / "chrome.json").write_text(json.dumps(memory))
+            embedding_calls = []
+
+            def embed(texts: list[str]) -> list[list[float]]:
+                embedding_calls.append(list(texts))
+                return [[1.0, 0.0] for _ in texts]
+
+            store = MemoryVectorStore(
+                memories_dir=memories,
+                index_path=root / "index.sqlite3",
+                embed_function=embed,
+            )
+            matches = store.search("open chrome", minimum_score=0.99)
+
+            self.assertEqual(matches[0]["run_id"], "chrome-run")
+            self.assertEqual(matches[0]["score"], 1.0)
+            self.assertEqual(matches[0]["match_type"], "exact_task")
+            self.assertEqual(len(embedding_calls), 1)
+
     def test_conversation_streams_model_output_to_terminal(self) -> None:
         chunks = [
             SimpleNamespace(
@@ -115,6 +398,32 @@ class MemoryTests(unittest.TestCase):
 
         self.assertEqual(image_urls, ["data:image/png;base64,second"])
         self.assertEqual(messages[1]["content"], [{"type": "text", "text": "first"}])
+
+    def test_extra_memory_guidance_is_ephemeral(self) -> None:
+        captured_messages = []
+        fake_litellm = types.ModuleType("litellm")
+
+        def completion(**kwargs):
+            captured_messages.extend(kwargs["messages"])
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="{}"))],
+                usage={},
+            )
+
+        fake_litellm.completion = completion
+        fake_litellm.stream_chunk_builder = lambda chunks, messages: None
+        convo = Convo(system="system")
+        convo.user("task")
+
+        with patch.dict(sys.modules, {"litellm": fake_litellm}):
+            convo.complete(
+                model="test-model",
+                api_key="test-key",
+                extra_messages=[{"role": "user", "content": "retrieved guidance"}],
+            )
+
+        self.assertEqual(captured_messages[-1]["content"], "retrieved guidance")
+        self.assertNotIn("retrieved guidance", [message["content"] for message in convo.messages])
 
     def test_run_recorder_writes_incremental_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -233,6 +542,10 @@ class MemoryTests(unittest.TestCase):
 
             with (
                 patch("agent_loop.RunRecorder", side_effect=recorder_factory),
+                patch(
+                    "agent_loop.MemoryVectorStore",
+                    return_value=SimpleNamespace(search=MagicMock(return_value=[])),
+                ),
                 patch("agent_loop.observe_screen", side_effect=lambda: next(observations)),
                 patch("agent_loop._complete_json", side_effect=lambda *args, **kwargs: next(replies)),
                 patch(
@@ -279,6 +592,10 @@ class MemoryTests(unittest.TestCase):
             with (
                 patch("agent_loop.RunRecorder", side_effect=recorder_factory),
                 patch(
+                    "agent_loop.MemoryVectorStore",
+                    return_value=SimpleNamespace(search=MagicMock(return_value=[])),
+                ),
+                patch(
                     "agent_loop.observe_screen",
                     return_value=(
                         {"path": None, "width": 100, "height": 100},
@@ -315,6 +632,144 @@ class MemoryTests(unittest.TestCase):
                 for line in Path(result.run_path).read_text(encoding="utf-8").splitlines()
             ]
             self.assertEqual(run_events[-1]["status"], "completed_without_memory")
+
+    def test_agent_loop_reuses_exact_memory_instead_of_saving_duplicate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            existing_path = str(root / "memories" / "existing.json")
+            exact_match = {
+                "score": 1.0,
+                "match_type": "exact_task",
+                "path": existing_path,
+                "run_id": "existing-run",
+                "task": "open chrome",
+                "verification": {"success": True, "confidence": 0.96},
+                "playbook": {
+                    "learned_target_mappings": [
+                        {
+                            "requested": "Chrome / Google Chrome",
+                            "effective": "Chromium",
+                        }
+                    ],
+                    "preferred_plan": [],
+                },
+            }
+
+            def recorder_factory(task: str) -> RunRecorder:
+                return RunRecorder(task, directory=root / "runs")
+
+            with (
+                patch("agent_loop.RunRecorder", side_effect=recorder_factory),
+                patch(
+                    "agent_loop.MemoryVectorStore",
+                    return_value=SimpleNamespace(
+                        search=MagicMock(return_value=[exact_match]),
+                    ),
+                ),
+                patch(
+                    "agent_loop.observe_screen",
+                    return_value=(
+                        {"path": None, "width": 100, "height": 100},
+                        {"x": 1, "y": 2},
+                        None,
+                    ),
+                ),
+                patch(
+                    "agent_loop._complete_json",
+                    return_value={
+                        "reason": "Chromium is open.",
+                        "actions": [],
+                        "done": True,
+                    },
+                ),
+                patch("agent_loop.review_completed_run", return_value=successful_review()),
+                patch("agent_loop.save_memory") as save_mock,
+            ):
+                result = agent_loop.run_agent_loop(
+                    "open chrome",
+                    model="test-model",
+                    api_key="test-key",
+                    max_steps=1,
+                    verbose=False,
+                )
+
+            self.assertTrue(result.memory_verified)
+            self.assertEqual(result.memory_path, existing_path)
+            save_mock.assert_not_called()
+            run_events = [
+                json.loads(line)
+                for line in Path(result.run_path).read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(run_events[-1]["status"], "memory_reused")
+
+    def test_agent_loop_searches_memory_before_every_model_decision(self) -> None:
+        search = MagicMock(
+            return_value=[
+                {
+                    "score": 0.91,
+                    "run_id": "prior-run",
+                    "task": "open chrome",
+                    "verification": {"success": True, "confidence": 0.9},
+                    "playbook": {"preferred_plan": []},
+                }
+            ]
+        )
+        replies = iter(
+            [
+                {"reason": "Act.", "actions": [], "done": False},
+                {"reason": "Done.", "actions": [], "done": True},
+            ]
+        )
+        guidance_seen = []
+
+        def complete_json(*args, **kwargs):
+            guidance_seen.append(kwargs.get("memory_guidance"))
+            return next(replies)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            def recorder_factory(task: str) -> RunRecorder:
+                return RunRecorder(task, directory=root / "runs")
+
+            with (
+                patch("agent_loop.RunRecorder", side_effect=recorder_factory),
+                patch(
+                    "agent_loop.MemoryVectorStore",
+                    return_value=SimpleNamespace(search=search),
+                ),
+                patch(
+                    "agent_loop.observe_screen",
+                    return_value=(
+                        {"path": None, "width": 100, "height": 100},
+                        {"x": 1, "y": 2},
+                        None,
+                    ),
+                ),
+                patch("agent_loop._complete_json", side_effect=complete_json),
+                patch("agent_loop.run_actions_safe", return_value=[]),
+                patch(
+                    "agent_loop.review_completed_run",
+                    return_value={
+                        "verification": {
+                            "success": False,
+                            "confidence": 0.2,
+                            "summary": "Not verified.",
+                        },
+                        "playbook": {},
+                    },
+                ),
+            ):
+                agent_loop.run_agent_loop(
+                    "open chrome",
+                    model="test-model",
+                    api_key="test-key",
+                    max_steps=2,
+                    verbose=False,
+                )
+
+        self.assertEqual(search.call_count, 2)
+        self.assertTrue(all("retrieved_memory_guidance" in item for item in guidance_seen))
 
 
 if __name__ == "__main__":

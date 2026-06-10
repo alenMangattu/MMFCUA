@@ -19,6 +19,7 @@ from memory import (
     save_memory,
     verification_passed,
 )
+from memory_search import MemoryVectorStore, guidance_message, memory_save_decision
 from tools import mouse_position, run_actions_safe, screenshot, tools_json_for_prompt
 
 
@@ -196,6 +197,20 @@ def _observe_text(
     mouse: dict[str, Any],
     screen_change: dict[str, Any],
 ) -> str:
+    changed = screen_change.get("changed")
+    if changed is False:
+        action_feedback = (
+            "The previous action batch had no visible effect. Do not repeat the "
+            "same tools, nearby click coordinates, or the same strategy. Inspect "
+            "whether a modal or foreground window blocks the target. If so, resolve "
+            "only that blocker using a visible control, then observe again."
+        )
+    else:
+        action_feedback = (
+            "Use the new screenshot as the source of truth before selecting the "
+            "next action."
+        )
+
     return json.dumps(
         {
             "task": task,
@@ -208,10 +223,12 @@ def _observe_text(
             },
             "screen_change": screen_change,
             "mouse": mouse,
+            "last_action_outcome": action_feedback,
             "instruction": (
-                "Analyze the new screenshot and continue. If screen_change.changed is false, "
-                "do not assume the last action worked; choose a different method. Return only "
-                "the next JSON response."
+                "Analyze the new screenshot and continue. Visible background targets "
+                "are not actionable through a modal dialog. Resolve a blocker alone, "
+                "observe the result, and only then interact with the target. Return "
+                "only the next JSON response."
             ),
         },
         indent=2,
@@ -282,6 +299,7 @@ def _complete_json(
     model: str | None,
     api_key: str | None,
     stream_prefix: str,
+    memory_guidance: str | None = None,
 ) -> dict[str, Any]:
     cache_kwargs = _cache_kwargs()
     speed_kwargs = _model_speed_kwargs(model)
@@ -301,6 +319,11 @@ def _complete_json(
                 api_key=api_key,
                 stream_output=_env_bool("MMFCUA_STREAM_MODEL_OUTPUT", True),
                 stream_prefix=stream_prefix,
+                extra_messages=(
+                    [{"role": "user", "content": memory_guidance}]
+                    if memory_guidance
+                    else None
+                ),
                 **kwargs,
             )
             break
@@ -375,8 +398,44 @@ def run_agent_loop(
 
     last_reply: dict[str, Any] = {"reason": "", "actions": [], "done": False}
     previous_shot = first_shot
+    memory_store: MemoryVectorStore | None = None
+    memory_retrieval_error: str | None = None
+    try:
+        memory_store = MemoryVectorStore(api_key=api_key)
+    except Exception as error:
+        memory_retrieval_error = str(error)
+        log(f"[memory-search] unavailable: {error}", enabled=verbose)
 
     for step in range(1, max_steps + 1):
+        retrieved_memories: list[dict[str, Any]] = []
+        retrieved_guidance: str | None = None
+        if memory_store is not None:
+            try:
+                retrieved_memories = memory_store.search(
+                    task,
+                    limit=int(os.getenv("MMFCUA_MEMORY_SEARCH_LIMIT", "2")),
+                    minimum_score=float(
+                        os.getenv("MMFCUA_MEMORY_SEARCH_MIN_SCORE", "0.72")
+                    ),
+                )
+                retrieved_guidance = guidance_message(retrieved_memories)
+                if retrieved_memories:
+                    scores = [match["score"] for match in retrieved_memories]
+                    match_types = [
+                        match.get("match_type")
+                        for match in retrieved_memories
+                    ]
+                    log(
+                        f"[memory-search] step={step} hits={len(scores)} "
+                        f"scores={scores} types={match_types}",
+                        enabled=verbose,
+                    )
+                else:
+                    log(f"[memory-search] step={step} no relevant memory", enabled=verbose)
+            except Exception as error:
+                memory_retrieval_error = str(error)
+                log(f"[memory-search] step={step} failed: {error}", enabled=verbose)
+
         log(f"[step {step}] calling model={model!r}", enabled=verbose)
         try:
             reply = _complete_json(
@@ -384,6 +443,7 @@ def run_agent_loop(
                 model=model,
                 api_key=api_key,
                 stream_prefix=f"[step {step}] model stream: ",
+                memory_guidance=retrieved_guidance,
             )
         except Exception as error:
             log(f"[step {step}] model/parse error: {error}", enabled=verbose)
@@ -414,6 +474,7 @@ def run_agent_loop(
                     "screen_change": change,
                     "mouse_after": mouse,
                     "observation_error": observe_error,
+                    "retrieved_memories": retrieved_memories,
                 },
                 verbose=verbose,
             )
@@ -444,6 +505,7 @@ def run_agent_loop(
                         "mean_delta": None,
                         "reason": "no action; agent claimed completion",
                     },
+                    "retrieved_memories": retrieved_memories,
                 },
                 verbose=verbose,
             )
@@ -452,7 +514,7 @@ def run_agent_loop(
             memory_path: str | None = None
             memory_verified: bool | None = None
             memory_review: dict[str, Any] | None = None
-            memory_error = recorder_error
+            memory_error = recorder_error or memory_retrieval_error
 
             if recorder is not None:
                 log("[memory] verifying and reflecting on completed run", enabled=verbose)
@@ -477,21 +539,60 @@ def run_agent_loop(
                         enabled=verbose,
                     )
                     if memory_verified:
-                        saved_path = save_memory(
-                            make_memory(
-                                recorder=recorder,
-                                review=memory_review,
-                            )
+                        candidate_memory = make_memory(
+                            recorder=recorder,
+                            review=memory_review,
                         )
-                        memory_path = str(saved_path)
-                        log(f"[memory] saved reusable memory={memory_path}", enabled=verbose)
+                        should_save, save_reason = memory_save_decision(
+                            candidate_memory,
+                            retrieved_memories,
+                        )
+                        if should_save:
+                            saved_path = save_memory(candidate_memory)
+                            memory_path = str(saved_path)
+                            log(
+                                f"[memory] saved reusable memory={memory_path} "
+                                f"reason={save_reason}",
+                                enabled=verbose,
+                            )
+                            if memory_store is not None:
+                                try:
+                                    memory_store.refresh()
+                                    log("[memory-search] indexed new memory", enabled=verbose)
+                                except Exception as error:
+                                    memory_retrieval_error = str(error)
+                                    memory_error = str(error)
+                                    log(
+                                        f"[memory-search] could not index new memory: {error}",
+                                        enabled=verbose,
+                                    )
+                        else:
+                            memory_path = next(
+                                (
+                                    match.get("path")
+                                    for match in retrieved_memories
+                                    if match.get("match_type") == "exact_task"
+                                ),
+                                None,
+                            )
+                            log(
+                                f"[memory] reused existing memory path={memory_path} "
+                                f"reason={save_reason}",
+                                enabled=verbose,
+                            )
                     else:
                         log("[memory] verification rejected; reusable memory not saved", enabled=verbose)
                 except Exception as error:
                     memory_error = str(error)
                     log(f"[memory] post-task review failed: {error}", enabled=verbose)
 
-            finish_status = "memory_saved" if memory_path else "completed_without_memory"
+            if memory_path and any(
+                match.get("path") == memory_path
+                for match in retrieved_memories
+            ):
+                finish_status = "memory_reused"
+            else:
+                finish_status = "memory_saved" if memory_path else "completed_without_memory"
             _finish_run(
                 recorder,
                 finish_status,
@@ -563,6 +664,7 @@ def run_agent_loop(
                 "screen_change": change,
                 "mouse_after": mouse,
                 "observation_error": observe_error,
+                "retrieved_memories": retrieved_memories,
                 "coordinate_policy": (
                     "Coordinates are historical hints only; relocate semantic "
                     "targets from the current screenshot before reuse."

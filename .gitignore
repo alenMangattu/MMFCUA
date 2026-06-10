@@ -7,3 +7,4 @@ __pycache__/
 .screenshots/
 .runs/
 .memories/
+.memory_index.sqlite3*

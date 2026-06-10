@@ -99,6 +99,7 @@ class Conversation:
         api_key: str | None = None,
         stream_output: bool = False,
         stream_prefix: str = "[model] ",
+        extra_messages: list[Message] | None = None,
         **kwargs: Any,
     ) -> str:
         from dotenv import load_dotenv
@@ -106,6 +107,8 @@ class Conversation:
 
         load_dotenv()
         messages = self.to_litellm()
+        if extra_messages:
+            messages = [*messages, *extra_messages]
         request_started = time.perf_counter()
         first_token_at: float | None = None
 

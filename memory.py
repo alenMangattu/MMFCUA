@@ -10,92 +10,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from jinja2 import Template
+
 from conversation import Convo
 
 
 ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / ".runs"
 MEMORIES_DIR = ROOT / ".memories"
+MEMORY_PROMPT_PATH = ROOT / "memory_prompt.j2"
 MEMORY_SCHEMA_VERSION = 2
 DEFAULT_VERIFICATION_CONFIDENCE = 0.75
-
-REVIEW_SYSTEM_PROMPT = """You verify and distill a completed computer-use run.
-
-Use the original task, factual trajectory, final agent claim, and final screenshot.
-Return one JSON object only.
-
-First verify whether the requested task is visibly complete. Do not trust the
-agent's done claim without evidence. If the screenshot or trajectory is
-insufficient, mark success false or lower confidence and explain what is missing.
-
-Then produce a compact playbook for the next similar request. Learn the shortest
-reliable route in hindsight, not a narration of the exploratory run. For example,
-if a request named Chrome but the installed app that satisfied it was Chromium,
-record that requested-to-effective target mapping and make Chromium the preferred
-search target next time. Apply the same pattern to other applications, files,
-settings, websites, and UI tasks.
-
-Keep the output concise:
-- At most 3 learned target mappings.
-- At most 4 preferred-plan steps.
-- At most 2 fallback strategies.
-- At most 3 avoid rules, 2 timing notes, and 3 environment facts.
-
-Reusable guidance must describe semantic UI targets, intent, preconditions, and
-success checks. Mouse coordinates are historical debugging evidence only. Never
-include fixed coordinates. The next agent must inspect its current screenshot.
-
-Do not include the full trajectory, step-by-step assessments, failed-attempt
-narration, or one-time setup in the normal preferred plan. A fallback should only
-be included when it is useful after the preferred route fails.
-
-Return this shape:
-{
-  "verification": {
-    "success": true,
-    "confidence": 0.0,
-    "summary": "short visible proof or missing proof"
-  },
-  "playbook": {
-    "task_signature": "generalized description of the request",
-    "applicability": "when this memory is relevant",
-    "learned_target_mappings": [
-      {
-        "requested": "name or concept from the user request",
-        "effective": "target that actually satisfied the request",
-        "relationship": "alias, installed substitute, renamed target, or equivalent",
-        "confidence": 0.0,
-        "revalidate_next_time": true
-      }
-    ],
-    "preferred_plan": [
-      {
-        "intent": "goal of this step",
-        "target": "semantic UI target",
-        "method": "action without fixed coordinates",
-        "preconditions": ["what must be visible or true"],
-        "success_check": "visible evidence before continuing"
-      }
-    ],
-    "fallbacks": [
-      {
-        "when": "condition that makes the preferred plan fail",
-        "method": "short alternate strategy",
-        "success_check": "visible evidence of success"
-      }
-    ],
-    "avoid": [],
-    "timing_notes": [],
-    "environment_facts": [
-      {
-        "fact": "observed environment fact",
-        "confidence": 0.0,
-        "revalidate_next_time": true
-      }
-    ]
-  }
-}"""
-
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -330,6 +255,11 @@ def _review_trajectory(trajectory: list[dict[str, Any]]) -> list[dict[str, Any]]
     return compact
 
 
+def render_memory_prompt() -> str:
+    template = Template(MEMORY_PROMPT_PATH.read_text(encoding="utf-8"))
+    return template.render()
+
+
 def review_completed_run(
     *,
     task: str,
@@ -341,7 +271,7 @@ def review_completed_run(
 ) -> dict[str, Any]:
     """Use one model call to verify success and derive reusable lessons."""
 
-    convo = Convo(system=REVIEW_SYSTEM_PROMPT)
+    convo = Convo(system=render_memory_prompt())
     review_model = os.getenv("MMFCUA_REVIEW_MODEL", model or "gpt-5.4-mini")
     review_input = json.dumps(
         {

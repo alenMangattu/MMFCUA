@@ -229,6 +229,10 @@ Rules:
 - All `x` and `y` mouse coordinates must be in screenshot pixel coordinates:
   origin is top-left, x increases right, y increases down, max width is
   `screenshot_width`, and max height is `screenshot_height`.
+- Mouse tools automatically glide to their target with eased, distance-based
+  movement before clicking, pressing, releasing, or dragging. Do not add a
+  separate `mouse_move` before a click unless merely repositioning the pointer
+  is itself the intended action.
 - Use `mouse_double_click` for double-click behavior.
 - Use `mouse_drag` for normal drag from one coordinate to another. Use
   `mouse_down`, `mouse_move`, and `mouse_up` only when you need finer manual
@@ -241,6 +245,14 @@ Rules:
   menu opens, dialog opens, or any click that changes the UI, include a short
   `wait` before the next dependent action. Use about 0.3-0.7 seconds for small UI
   changes and 1-3 seconds for app/browser/page loading.
+- After typing into Spotlight, app search, launcher search, browser suggestions,
+  settings search, or any asynchronous result list, wait at least 0.8 seconds
+  before pressing Enter. The execution layer adds this delay automatically when
+  `type_text` is followed directly by Enter, but you should still express the
+  wait explicitly when the next result must be visually inspected.
+- Do not assume the first highlighted search result is the intended result.
+  When practical, type the query, wait, inspect the next screenshot, and only
+  then press Enter after confirming the visible result.
 - You are an iterative computer-use agent. You do not need to finish everything
   in one response. Act, get the next screenshot/tool result, analyze the new
   state, then act again until the small task is complete.
@@ -250,8 +262,20 @@ Rules:
   It does not mean the UI changed or the task succeeded. Trust the next
   screenshot and `screen_change` observation more than the tool result.
 - If `screen_change.changed` is false, the last action probably did nothing.
-  Do not describe the intended result as if it happened. Try a different
-  reliable method, such as keyboard shortcuts or search, when appropriate.
+  Do not repeat the same action, nearby click coordinates, or the same strategy.
+  Re-read the screenshot and choose a materially different recovery.
+- A visible target is not necessarily actionable. If a modal dialog, sheet,
+  popover, permission prompt, or foreground window blocks the target, you cannot
+  click through it. Resolve the blocking UI first.
+- When a modal blocks the requested target, perform only the action needed to
+  dismiss or complete the modal, then stop and inspect the next screenshot.
+  Do not batch a click on the background target into the same response because
+  its position and focus may change after the modal closes.
+- Use visible dialog controls before guessing: buttons such as Close, Cancel,
+  Exit, Done, OK, or their localized equivalents. Click the center of the
+  visible control. Do not say "ignore the dialog" and click behind it.
+- If keyboard Escape does not dismiss a modal and the screen does not change,
+  do not press Escape again. Use a visible dialog button.
 - For opening an app on macOS, use normal primitive keyboard/mouse actions.
   Spotlight is usually the reliable keyboard path: press `Command` + `Space`,
   wait, type the app name, press `Enter`, wait for the app to load, then inspect
@@ -263,6 +287,9 @@ Rules:
 - If the requested small task is already satisfied in the screenshot, return
   `"done": true` with no actions.
 - Use visible evidence from the screenshot before acting.
+- Before clicking, verify that the target is unobstructed and estimate the
+  center of the target using the full screenshot pixel dimensions. Do not reuse
+  coordinates from a previous screenshot after a dialog or window changes.
 - Do not invent UI elements that are not visible.
 - If the target is ambiguous, choose the safest action that gathers more
   information, such as waiting, scrolling, or requesting another screenshot.

@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import time
 import json
+import math
+import os
 import struct
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -56,6 +58,87 @@ def _require_button(button: str) -> str:
     if button not in {"left", "right", "middle"}:
         raise ValueError("button must be one of: left, right, middle.")
     return button
+
+
+def _post_type_settle_seconds() -> float:
+    try:
+        return max(
+            0.0,
+            float(os.getenv("MMFCUA_POST_TYPE_SETTLE_SECONDS", "0.8")),
+        )
+    except ValueError:
+        return 0.8
+
+
+def _default_type_interval() -> float:
+    try:
+        return max(
+            0.0,
+            float(os.getenv("MMFCUA_TYPE_INTERVAL", "0.02")),
+        )
+    except ValueError:
+        return 0.02
+
+
+def _movement_duration(
+    current_x: int | float,
+    current_y: int | float,
+    target_x: int | float,
+    target_y: int | float,
+) -> float:
+    distance = math.hypot(target_x - current_x, target_y - current_y)
+    if distance < 1:
+        return 0.0
+
+    try:
+        pixels_per_second = max(
+            100.0,
+            float(os.getenv("MMFCUA_MOUSE_PIXELS_PER_SECOND", "1800")),
+        )
+    except ValueError:
+        pixels_per_second = 1800.0
+
+    try:
+        minimum = max(0.0, float(os.getenv("MMFCUA_MOUSE_MIN_DURATION", "0.12")))
+    except ValueError:
+        minimum = 0.12
+
+    try:
+        maximum = max(minimum, float(os.getenv("MMFCUA_MOUSE_MAX_DURATION", "0.7")))
+    except ValueError:
+        maximum = 0.7
+
+    return round(min(maximum, max(minimum, distance / pixels_per_second)), 3)
+
+
+def _smooth_move(pg: Any, screen_x: float, screen_y: float) -> float:
+    current = pg.position()
+    duration = _movement_duration(current.x, current.y, screen_x, screen_y)
+    if duration == 0:
+        return duration
+
+    tween = getattr(pg, "easeInOutQuad", None)
+    if tween is None:
+        pg.moveTo(screen_x, screen_y, duration=duration)
+    else:
+        pg.moveTo(screen_x, screen_y, duration=duration, tween=tween)
+    return duration
+
+
+def _smooth_drag_duration(
+    screen_x: float,
+    screen_y: float,
+    screen_to_x: float,
+    screen_to_y: float,
+    requested_duration: float,
+) -> float:
+    natural_duration = _movement_duration(
+        screen_x,
+        screen_y,
+        screen_to_x,
+        screen_to_y,
+    )
+    return max(requested_duration, natural_duration)
 
 
 def _remember_coordinate_space(
@@ -158,38 +241,74 @@ def _normalize_key(key: str) -> str:
 def mouse_move(x: int | float, y: int | float) -> dict[str, Any]:
     pg = _pyautogui()
     screen_x, screen_y = _to_screen_coordinates(x, y)
-    pg.moveTo(screen_x, screen_y)
-    return {"x": x, "y": y, "screen_x": screen_x, "screen_y": screen_y}
+    movement_duration = _smooth_move(pg, screen_x, screen_y)
+    return {
+        "x": x,
+        "y": y,
+        "screen_x": screen_x,
+        "screen_y": screen_y,
+        "movement_duration": movement_duration,
+    }
 
 
 def mouse_click(button: str, x: int | float, y: int | float) -> dict[str, Any]:
     pg = _pyautogui()
     screen_x, screen_y = _to_screen_coordinates(x, y)
-    pg.click(x=screen_x, y=screen_y, button=_require_button(button))
-    return {"button": button, "x": x, "y": y, "screen_x": screen_x, "screen_y": screen_y}
+    movement_duration = _smooth_move(pg, screen_x, screen_y)
+    pg.click(button=_require_button(button))
+    return {
+        "button": button,
+        "x": x,
+        "y": y,
+        "screen_x": screen_x,
+        "screen_y": screen_y,
+        "movement_duration": movement_duration,
+    }
 
 
 def mouse_double_click(button: str, x: int | float, y: int | float) -> dict[str, Any]:
     pg = _pyautogui()
     screen_x, screen_y = _to_screen_coordinates(x, y)
-    pg.doubleClick(x=screen_x, y=screen_y, button=_require_button(button))
-    return {"button": button, "x": x, "y": y, "screen_x": screen_x, "screen_y": screen_y}
+    movement_duration = _smooth_move(pg, screen_x, screen_y)
+    pg.doubleClick(button=_require_button(button))
+    return {
+        "button": button,
+        "x": x,
+        "y": y,
+        "screen_x": screen_x,
+        "screen_y": screen_y,
+        "movement_duration": movement_duration,
+    }
 
 
 def mouse_down(button: str, x: int | float, y: int | float) -> dict[str, Any]:
     pg = _pyautogui()
     screen_x, screen_y = _to_screen_coordinates(x, y)
-    pg.moveTo(screen_x, screen_y)
+    movement_duration = _smooth_move(pg, screen_x, screen_y)
     pg.mouseDown(button=_require_button(button))
-    return {"button": button, "x": x, "y": y, "screen_x": screen_x, "screen_y": screen_y}
+    return {
+        "button": button,
+        "x": x,
+        "y": y,
+        "screen_x": screen_x,
+        "screen_y": screen_y,
+        "movement_duration": movement_duration,
+    }
 
 
 def mouse_up(button: str, x: int | float, y: int | float) -> dict[str, Any]:
     pg = _pyautogui()
     screen_x, screen_y = _to_screen_coordinates(x, y)
-    pg.moveTo(screen_x, screen_y)
+    movement_duration = _smooth_move(pg, screen_x, screen_y)
     pg.mouseUp(button=_require_button(button))
-    return {"button": button, "x": x, "y": y, "screen_x": screen_x, "screen_y": screen_y}
+    return {
+        "button": button,
+        "x": x,
+        "y": y,
+        "screen_x": screen_x,
+        "screen_y": screen_y,
+        "movement_duration": movement_duration,
+    }
 
 
 def mouse_drag(
@@ -203,9 +322,23 @@ def mouse_drag(
     pg = _pyautogui()
     screen_x, screen_y = _to_screen_coordinates(x, y)
     screen_to_x, screen_to_y = _to_screen_coordinates(to_x, to_y)
-    drag_duration = _require_number("duration", duration)
-    pg.moveTo(screen_x, screen_y)
-    pg.dragTo(screen_to_x, screen_to_y, duration=drag_duration, button=_require_button(button))
+    requested_duration = _require_number("duration", duration)
+    approach_duration = _smooth_move(pg, screen_x, screen_y)
+    drag_duration = _smooth_drag_duration(
+        screen_x,
+        screen_y,
+        screen_to_x,
+        screen_to_y,
+        requested_duration,
+    )
+    tween = getattr(pg, "easeInOutQuad", None)
+    drag_kwargs = {
+        "duration": drag_duration,
+        "button": _require_button(button),
+    }
+    if tween is not None:
+        drag_kwargs["tween"] = tween
+    pg.dragTo(screen_to_x, screen_to_y, **drag_kwargs)
     return {
         "button": button,
         "x": x,
@@ -217,15 +350,21 @@ def mouse_drag(
         "screen_to_x": screen_to_x,
         "screen_to_y": screen_to_y,
         "duration": drag_duration,
+        "approach_duration": approach_duration,
     }
 
 
-def type_text(text: str, interval: int | float = 0) -> dict[str, Any]:
+def type_text(text: str, interval: int | float | None = None) -> dict[str, Any]:
     if not isinstance(text, str):
         raise TypeError("text must be a string.")
     pg = _pyautogui()
-    pg.write(text, interval=_require_number("interval", interval))
-    return {"text": text}
+    typing_interval = (
+        _default_type_interval()
+        if interval is None
+        else _require_number("interval", interval)
+    )
+    pg.write(text, interval=typing_interval)
+    return {"text": text, "interval": typing_interval}
 
 
 def key_press(key: str) -> dict[str, Any]:
@@ -341,37 +480,37 @@ def screen_size() -> dict[str, Any]:
 TOOLS = [
     tool(
         name="mouse_move",
-        description="Move the mouse pointer to absolute screen coordinates.",
+        description="Smoothly move the mouse pointer to absolute screen coordinates.",
         arguments={"x": "number", "y": "number"},
         function=mouse_move,
     ),
     tool(
         name="mouse_click",
-        description="Click one mouse button at absolute screen coordinates.",
+        description="Smoothly move to absolute coordinates, then click one mouse button.",
         arguments={"button": "left | right | middle", "x": "number", "y": "number"},
         function=mouse_click,
     ),
     tool(
         name="mouse_double_click",
-        description="Double-click one mouse button at absolute screen coordinates.",
+        description="Smoothly move to absolute coordinates, then double-click one mouse button.",
         arguments={"button": "left | right | middle", "x": "number", "y": "number"},
         function=mouse_double_click,
     ),
     tool(
         name="mouse_down",
-        description="Move to absolute screen coordinates and hold one mouse button down.",
+        description="Smoothly move to absolute coordinates and hold one mouse button down.",
         arguments={"button": "left | right | middle", "x": "number", "y": "number"},
         function=mouse_down,
     ),
     tool(
         name="mouse_up",
-        description="Move to absolute screen coordinates and release one mouse button.",
+        description="Smoothly move to absolute coordinates and release one mouse button.",
         arguments={"button": "left | right | middle", "x": "number", "y": "number"},
         function=mouse_up,
     ),
     tool(
         name="mouse_drag",
-        description="Drag from one absolute coordinate to another.",
+        description="Smoothly move to the start coordinate, then drag with eased movement.",
         arguments={
             "button": "left | right | middle",
             "x": "number",
@@ -384,7 +523,7 @@ TOOLS = [
     ),
     tool(
         name="type_text",
-        description="Type literal text into the focused UI element.",
+        description="Type literal text into the focused UI element at a readable pace.",
         arguments={"text": "string", "interval": "number, optional seconds between characters"},
         function=type_text,
     ),
@@ -464,6 +603,7 @@ def run_actions(actions: list[dict[str, Any]]) -> list[Any]:
 
 def run_actions_safe(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     results = []
+    typed_text_needs_settle = False
     for index, action in enumerate(actions):
         try:
             if not isinstance(action, dict):
@@ -474,8 +614,38 @@ def run_actions_safe(actions: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 raise TypeError("action.tool must be a string.")
             if not isinstance(arguments, dict):
                 raise TypeError("action.arguments must be an object.")
+
+            automatic_wait = None
+            is_enter = (
+                name == "key_press"
+                and arguments.get("key") == "Enter"
+            )
+            if typed_text_needs_settle and is_enter:
+                settle_seconds = _post_type_settle_seconds()
+                if settle_seconds:
+                    time.sleep(settle_seconds)
+                    automatic_wait = {
+                        "reason": "allow typed search results or UI suggestions to update",
+                        "seconds": settle_seconds,
+                    }
+
             result = call_tool(name, arguments)
-            results.append({"index": index, "tool": name, "ok": True, "result": result})
+            tool_result = {
+                "index": index,
+                "tool": name,
+                "ok": True,
+                "result": result,
+            }
+            if automatic_wait is not None:
+                tool_result["automatic_wait_before"] = automatic_wait
+            results.append(tool_result)
+
+            if name == "type_text":
+                typed_text_needs_settle = True
+            elif name == "wait":
+                typed_text_needs_settle = False
+            elif is_enter:
+                typed_text_needs_settle = False
         except Exception as error:
             results.append({
                 "index": index,
