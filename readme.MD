@@ -1,142 +1,160 @@
+<div align="center">
+
 # MMFCUA
 
-**A computer-use agent that turns successful UI interactions into reusable
-procedural memory.**
+### Muscle memory for computer-use agents
 
-MMFCUA completes small macOS tasks through screenshots, mouse input, and
-keyboard input. Its central concern is not simply getting an LLM to click the
-right place once. It is deciding what should be learned from a successful run,
-storing that knowledge in a durable form, and retrieving it when a similar task
-appears later.
+**A macOS agent that turns successful UI interactions into reusable procedural
+memory.**
 
-The result is a small research-oriented system for **verified agent memory**:
+</div>
 
-- every interaction is recorded as a factual execution trace;
-- claimed success is reviewed against the final screen;
-- only sufficiently credible runs become reusable memories;
-- memories are stored as semantic playbooks rather than raw action replays;
-- relevant playbooks are retrieved through lexical and vector search;
-- the current screen always overrides historical experience.
+---
 
-MMFCUA is intentionally limited to short, visually verifiable desktop tasks. It
-is not a general desktop assistant or a chat interface around an automation
-script.
+MMFCUA completes small desktop tasks through screenshots, mouse input, and
+keyboard input. The interesting part is not getting a model to click the right
+place once. It is deciding what can be learned from a successful run, storing
+that knowledge safely, and making it useful when a similar task appears later.
 
-## The memory system
+> **Core idea:** a completion claim is not a memory. A run becomes reusable only
+> after its final state has been independently reviewed and its useful structure
+> has been distilled into a confidence-gated playbook.
 
-The main artifact produced by MMFCUA is not a conversation transcript. It is a
-verified description of how a class of task was completed.
+## At a glance
 
-### 1. Record the run
+| | |
+|---|---|
+| **Input** | A short, visually verifiable desktop task |
+| **Control** | Screenshots and constrained `pyautogui` actions |
+| **Evidence** | Append-only JSONL execution traces |
+| **Admission** | Independent review of the final screen and trajectory |
+| **Memory** | Structured procedural playbooks stored as JSON |
+| **Retrieval** | Exact, lexical, and embedding-based search over SQLite |
+| **Policy** | Current visual state always overrides historical experience |
 
-Each task creates an append-only JSONL trace in `.runs/`. The trace contains the
-initial observation, model decisions, executed actions, tool outcomes, screen
-changes, and the final completion claim.
+MMFCUA is a focused research prototype, not a general desktop assistant or a
+chat interface around an automation script.
 
-Recording is incremental, so evidence from a partial run survives a crash or
-interruption.
+## Memory lifecycle
 
-### 2. Verify completion
-
-An agent saying `done` is not treated as proof of success.
-
-Once completion is claimed, a separate review pass receives the final
-screenshot and a compact version of the trajectory. It evaluates whether the
-requested outcome is visibly supported and assigns a confidence score. Runs
-below `MMFCUA_MEMORY_MIN_CONFIDENCE` are retained as traces but are not promoted
-to memory.
-
-This separates **task execution** from **memory admission**. A weak or mistaken
-completion claim does not automatically become future guidance.
-
-### 3. Distill a playbook
-
-A verified run is reduced to a small procedural representation containing:
-
-- a task signature and applicability boundary;
-- learned mappings between requested and effective UI targets;
-- a preferred plan with preconditions and success checks;
-- bounded fallback strategies;
-- actions or assumptions to avoid;
-- timing and environment facts that may require revalidation.
-
-The playbook preserves reusable structure while discarding most run-specific
-noise. Pointer coordinates are explicitly treated as historical evidence, never
-as instructions to replay.
-
-### 4. Store and index it
-
-Verified playbooks are written as JSON documents in `.memories/`. Their
-embeddings and source documents are maintained in a local SQLite index at
-`.memory_index.sqlite3`.
-
-The index is updated incrementally. Existing exact-task memories are reused
-instead of duplicated unless a new run contributes a previously unseen target
-mapping.
-
-### 5. Retrieve relevant experience
-
-Before each model decision, MMFCUA searches memory using:
-
-- exact normalized task matching;
-- lexical matching over task signatures and learned aliases;
-- cosine similarity over embeddings.
-
-Only results above the configured relevance threshold are injected into the
-decision context. Retrieved memories are advisory: aliases, application state,
-preconditions, and success criteria must be checked against the current
-screenshot.
-
-```text
-                       successful run
-                             |
-                             v
-task -> act -> observe -> completion claim
-                             |
-                             v
-                  independent verification
-                             |
-                    confidence threshold
-                       /           \
-                  rejected       accepted
-                     |              |
-                  trace only     distill playbook
-                                    |
-                              store + embed
-                                    |
-                         retrieve on future tasks
+```mermaid
+flowchart LR
+    A["Run a task"] --> B["Record the trajectory"]
+    B --> C["Agent claims completion"]
+    C --> D["Review final state"]
+    D --> E{"Verified above threshold?"}
+    E -- "No" --> F["Keep trace only"]
+    E -- "Yes" --> G["Distill procedural playbook"]
+    G --> H["Store JSON memory"]
+    H --> I["Embed into SQLite index"]
+    I --> J["Retrieve for similar tasks"]
+    J -. "Advisory context" .-> A
 ```
 
-## The execution loop
+### 1. Record
 
-Memory supports a deliberately small computer-control loop:
+Every task creates an append-only trace in `.runs/`. It captures:
 
-1. Capture the screen and pointer position.
-2. Retrieve relevant verified playbooks.
-3. Ask a vision-capable model for a short batch of primitive actions.
-4. Execute the actions with `pyautogui`.
-5. Capture the screen again and measure visible change.
-6. Continue, revise the strategy, or claim completion.
+- the initial screen and pointer state;
+- model decisions and requested actions;
+- tool outcomes and observation errors;
+- visible screen changes;
+- the final completion claim.
 
-The model emits structured JSON rather than free-form instructions. Available
-operations include pointer movement, clicks, dragging, scrolling, text entry,
+Events are written incrementally, so evidence from an interrupted run survives.
+
+### 2. Verify
+
+The execution agent saying `done` is not accepted as proof.
+
+A separate review pass examines the final screenshot and a compact trajectory.
+It decides whether the requested outcome is visibly supported and assigns a
+confidence score. Runs below `MMFCUA_MEMORY_MIN_CONFIDENCE` remain available as
+traces but are not promoted into reusable memory.
+
+This creates a deliberate boundary between **task execution** and **memory
+admission**.
+
+### 3. Distill
+
+Verified runs are compressed into procedural playbooks:
+
+| Playbook field | Purpose |
+|---|---|
+| Task signature | Identifies the class of task |
+| Applicability | Defines when the memory is relevant |
+| Target mappings | Connects requested concepts to effective UI targets |
+| Preferred plan | Preserves useful steps, preconditions, and checks |
+| Fallbacks | Records bounded alternative strategies |
+| Avoid list | Captures actions or assumptions that failed |
+| Environment facts | Retains context that must be revalidated |
+
+The playbook keeps reusable structure without preserving the run as a brittle
+macro.
+
+> [!IMPORTANT]
+> Historical pointer coordinates are evidence, not executable instructions.
+> MMFCUA must locate semantic targets again from the current screenshot.
+
+### 4. Store
+
+Accepted playbooks are written to `.memories/` as readable JSON documents. Their
+embeddings and source data are maintained in a local SQLite index:
+
+```text
+.runs/                  append-only execution evidence
+.memories/              verified procedural playbooks
+.memory_index.sqlite3   local semantic search index
+```
+
+The index refreshes incrementally. Exact-task memories are reused rather than
+duplicated unless a later run contributes a previously unseen target mapping.
+
+### 5. Retrieve
+
+Before each decision, MMFCUA searches prior experience using three signals:
+
+1. exact normalized task matching;
+2. lexical overlap across task signatures and learned aliases;
+3. cosine similarity over embeddings.
+
+Only memories above the relevance threshold enter the model context. Retrieved
+knowledge remains advisory: application state, aliases, preconditions, and
+success checks must all be confirmed against the current screen.
+
+## Execution loop
+
+```mermaid
+flowchart TD
+    A["Capture screen + pointer"] --> B["Retrieve verified memories"]
+    B --> C["Model proposes primitive actions"]
+    C --> D["Execute with pyautogui"]
+    D --> E["Capture the new screen"]
+    E --> F{"Task complete?"}
+    F -- "No" --> G["Measure change and revise"]
+    G --> B
+    F -- "Yes" --> H["Begin memory verification"]
+```
+
+The model emits structured JSON rather than free-form instructions. Its action
+space is limited to pointer movement, clicks, dragging, scrolling, typing,
 keyboard shortcuts, and waits.
 
-A lightweight image diff identifies action batches with no visible effect. The
-next decision is then instructed to inspect blockers or change strategy instead
-of repeating nearby clicks. The textual trajectory is retained in context, but
-only the newest screenshot is sent to the model.
+A lightweight image diff detects action batches with no visible effect. The
+next decision is then prompted to inspect blockers or change strategy instead
+of repeating nearby clicks. Textual history remains available, while only the
+newest screenshot is retained in model context.
 
-The LLM is therefore one component in the system: it proposes actions and
-reviews outcomes. Trace persistence, admission policy, playbook structure,
-retrieval, and execution safety are implemented locally.
+The LLM is one replaceable component in this system. Trace persistence,
+admission policy, playbook structure, retrieval, deduplication, and tool
+execution are implemented locally.
 
-## Project structure
+## Architecture
 
 ```text
 agent_loop.py       observation, retrieval, action, and verification lifecycle
-memory.py           run recording, completion review, and playbook persistence
-memory_search.py    SQLite vector index, retrieval, and memory deduplication
+memory.py           run recording, review, and playbook persistence
+memory_search.py    SQLite vector index, retrieval, and deduplication
 tools.py            constrained mouse and keyboard primitives
 conversation.py     multimodal LiteLLM conversation state
 prompt.j2           computer-use policy and action contract
@@ -145,25 +163,21 @@ prompt_ui.py        native task-input launcher
 components/         Swift/AppKit prompt interface
 ```
 
-## Requirements
+## Quick start
+
+### Requirements
 
 - macOS
 - Python and `pip`
 - Xcode Command Line Tools
 - an OpenAI API key
 
-The task prompt is a small Swift/AppKit application compiled with `swiftc` on
-its first run:
+### Install
+
+The native task prompt is compiled with `swiftc` on its first run:
 
 ```bash
 xcode-select --install
-```
-
-## Installation
-
-Install the Python dependencies:
-
-```bash
 pip install -r requirements.txt
 ```
 
@@ -174,16 +188,16 @@ OPENAI_API_KEY=...
 LITELLM_MODEL=gpt-5.4-mini
 ```
 
-Start MMFCUA:
+Run:
 
 ```bash
 python main.py
 ```
 
-A native prompt window appears near the bottom of the active display. Enter one
-short task and press **Enter**. Press **Escape** to close it without submitting.
+A native prompt appears near the bottom of the active display. Enter one short
+task and press **Enter**. Press **Escape** to close it without submitting.
 
-Example tasks:
+### Example tasks
 
 ```text
 open Firefox and search for weather in Rome
@@ -191,8 +205,7 @@ open the Downloads folder
 find the keyboard settings
 ```
 
-Tasks work best when they have one concrete outcome that can be confirmed from
-the screen.
+The best tasks have one concrete outcome that can be confirmed visually.
 
 ## macOS permissions
 
@@ -205,9 +218,10 @@ In **System Settings > Privacy & Security**, grant the terminal or IDE running
 Fully quit and reopen the terminal or IDE after changing either permission.
 Without them, screenshots may be blank and input actions may silently fail.
 
-The current implementation assumes macOS screenshots, AppKit, and macOS
-keyboard conventions. Windows and Linux support would require replacing those
-platform-specific components.
+> [!NOTE]
+> The current implementation assumes macOS screenshots, AppKit, and macOS
+> keyboard conventions. Windows and Linux support would require replacing those
+> platform-specific components.
 
 ## Configuration
 
@@ -243,7 +257,8 @@ MMFCUA_POST_TYPE_SETTLE_SECONDS=0.8
 
 `OPENAI_SERVICE_TIER` is passed through when present.
 
-## Operational notes
+<details>
+<summary><strong>Troubleshooting the native prompt</strong></summary>
 
 If the prompt window does not open:
 
@@ -251,8 +266,11 @@ If the prompt window does not open:
 - install the Xcode Command Line Tools with `xcode-select --install`;
 - allow `.build/prompt_input` in **System Settings > Privacy & Security** if
   macOS blocks it;
-- run the project from a normal logged-in desktop session rather than a
-  headless shell.
+- run from a normal logged-in desktop session rather than a headless shell.
 
-MMFCUA can move the pointer and type into the active interface. Use it in a
+</details>
+
+## Safety
+
+MMFCUA can move the pointer and type into the active interface. Run it in a
 supervised desktop session and begin with low-risk tasks.
