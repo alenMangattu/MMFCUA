@@ -10,7 +10,7 @@ def main() -> None:
     print("[main] loading environment", flush=True)
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY")
-    model = os.getenv("LITELLM_MODEL", "gpt-5.5")
+    model = os.getenv("LITELLM_MODEL", "gpt-5.4-mini")
     print(f"[main] model={model!r}", flush=True)
 
     if not api_key:

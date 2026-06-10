@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import io
 import json
+import sys
 import tempfile
+import types
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import agent_loop
+from conversation import Convo
 from memory import (
     RunRecorder,
     make_memory,
@@ -60,6 +66,56 @@ def successful_review() -> dict:
 
 
 class MemoryTests(unittest.TestCase):
+    def test_conversation_streams_model_output_to_terminal(self) -> None:
+        chunks = [
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content='{"done":'))]
+            ),
+            SimpleNamespace(
+                choices=[SimpleNamespace(delta=SimpleNamespace(content="true}"))]
+            ),
+        ]
+        fake_litellm = types.ModuleType("litellm")
+        fake_litellm.completion = lambda **kwargs: iter(chunks)
+        fake_litellm.stream_chunk_builder = lambda chunks, messages: SimpleNamespace(
+            usage={"prompt_tokens": 10}
+        )
+
+        convo = Convo(system="system")
+        convo.user("task")
+        output = io.StringIO()
+        with patch.dict(sys.modules, {"litellm": fake_litellm}):
+            with redirect_stdout(output):
+                text = convo.complete(
+                    model="test-model",
+                    api_key="test-key",
+                    stream_output=True,
+                    stream_prefix="[stream] ",
+                )
+
+        self.assertEqual(text, '{"done":true}')
+        self.assertEqual(output.getvalue(), '[stream] {"done":true}\n')
+        self.assertIsNotNone(convo.last_timing["time_to_first_token"])
+        self.assertEqual(convo.messages[-1]["content"], '{"done":true}')
+
+    def test_conversation_keeps_only_latest_screenshot_for_requests(self) -> None:
+        convo = Convo(system="system")
+        convo.user("first", screenshot={"data_uri": "data:image/png;base64,first"})
+        convo.assistant("action")
+        convo.user("second", screenshot={"data_uri": "data:image/png;base64,second"})
+
+        messages = convo.to_litellm()
+        image_urls = [
+            part["image_url"]["url"]
+            for message in messages
+            if isinstance(message["content"], list)
+            for part in message["content"]
+            if part.get("type") == "image_url"
+        ]
+
+        self.assertEqual(image_urls, ["data:image/png;base64,second"])
+        self.assertEqual(messages[1]["content"], [{"type": "text", "text": "first"}])
+
     def test_run_recorder_writes_incremental_jsonl(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             recorder = RunRecorder("Open Chromium", directory=Path(temporary))

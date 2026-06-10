@@ -342,6 +342,7 @@ def review_completed_run(
     """Use one model call to verify success and derive reusable lessons."""
 
     convo = Convo(system=REVIEW_SYSTEM_PROMPT)
+    review_model = os.getenv("MMFCUA_REVIEW_MODEL", model or "gpt-5.4-mini")
     review_input = json.dumps(
         {
             "task": task,
@@ -362,17 +363,39 @@ def review_completed_run(
         convo.user(review_input)
 
     attempts = [
+        {
+            "response_format": {"type": "json_object"},
+            "reasoning_effort": os.getenv("MMFCUA_REASONING_EFFORT", "none"),
+            "verbosity": os.getenv("MMFCUA_VERBOSITY", "low"),
+            "max_completion_tokens": 1400,
+        },
         {"response_format": {"type": "json_object"}},
         {},
     ]
     last_error: Exception | None = None
     for kwargs in attempts:
         try:
-            text = convo.complete(model=model, api_key=api_key, **kwargs)
+            text = convo.complete(
+                model=review_model,
+                api_key=api_key,
+                stream_output=os.getenv("MMFCUA_STREAM_MODEL_OUTPUT", "1").lower()
+                not in {"0", "false", "no", "off"},
+                stream_prefix="[memory] model stream: ",
+                **kwargs,
+            )
             return normalize_review(_extract_json(text))
         except Exception as error:
             last_error = error
-            if "response_format" not in str(error).lower():
+            error_text = str(error).lower()
+            if not any(
+                name in error_text
+                for name in (
+                    "response_format",
+                    "reasoning_effort",
+                    "verbosity",
+                    "max_completion_tokens",
+                )
+            ):
                 raise
 
     if last_error:

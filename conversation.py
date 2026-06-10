@@ -6,6 +6,7 @@ import base64
 import json
 import mimetypes
 import os
+import time
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -57,6 +58,7 @@ class Conversation:
         self._messages: list[Message] = []
         self.last_response: Any | None = None
         self.last_usage: Any | None = None
+        self.last_timing: dict[str, float | None] = {}
         if system:
             self.system(system)
 
@@ -95,21 +97,67 @@ class Conversation:
         *,
         model: str | None = None,
         api_key: str | None = None,
+        stream_output: bool = False,
+        stream_prefix: str = "[model] ",
         **kwargs: Any,
     ) -> str:
         from dotenv import load_dotenv
-        from litellm import completion
+        from litellm import completion, stream_chunk_builder
 
         load_dotenv()
-        response = completion(
-            model=model or os.getenv("LITELLM_MODEL", "gpt-4.1-nano"),
-            api_key=api_key or os.getenv("OPENAI_API_KEY"),
-            messages=self.to_litellm(),
-            **kwargs,
-        )
+        messages = self.to_litellm()
+        request_started = time.perf_counter()
+        first_token_at: float | None = None
+
+        if stream_output:
+            response_stream = completion(
+                model=model or os.getenv("LITELLM_MODEL", "gpt-5.4-mini"),
+                api_key=api_key or os.getenv("OPENAI_API_KEY"),
+                messages=messages,
+                stream=True,
+                **kwargs,
+            )
+            chunks = []
+            text_parts = []
+            print(stream_prefix, end="", flush=True)
+            for chunk in response_stream:
+                chunks.append(chunk)
+                choices = getattr(chunk, "choices", None) or []
+                delta = getattr(choices[0], "delta", None) if choices else None
+                content = getattr(delta, "content", None)
+                if content:
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                    text_parts.append(content)
+                    print(content, end="", flush=True)
+            print(flush=True)
+            text = "".join(text_parts)
+            try:
+                response = stream_chunk_builder(chunks, messages=messages)
+            except Exception:
+                response = chunks[-1] if chunks else None
+        else:
+            response = completion(
+                model=model or os.getenv("LITELLM_MODEL", "gpt-5.4-mini"),
+                api_key=api_key or os.getenv("OPENAI_API_KEY"),
+                messages=messages,
+                **kwargs,
+            )
+            text = response.choices[0].message.content or ""
+            if text:
+                first_token_at = time.perf_counter()
+
+        completed_at = time.perf_counter()
         self.last_response = response
         self.last_usage = getattr(response, "usage", None)
-        text = response.choices[0].message.content or ""
+        self.last_timing = {
+            "time_to_first_token": (
+                round(first_token_at - request_started, 3)
+                if first_token_at is not None
+                else None
+            ),
+            "total_seconds": round(completed_at - request_started, 3),
+        }
         self.assistant(text)
         return text
 
@@ -122,8 +170,28 @@ class Conversation:
         self.user(text, screenshot=screenshot)
         return self.complete(**kwargs)
 
-    def to_litellm(self) -> list[Message]:
-        return self._messages
+    def to_litellm(self, *, max_images: int = 1) -> list[Message]:
+        """Return all text history while retaining only the newest screenshots."""
+
+        remaining_images = max(0, max_images)
+        prepared: list[Message] = []
+        for message in reversed(self._messages):
+            content = message.get("content")
+            if not isinstance(content, list):
+                prepared.append(dict(message))
+                continue
+
+            filtered_content = []
+            for part in reversed(content):
+                if not isinstance(part, dict) or part.get("type") != "image_url":
+                    filtered_content.append(part)
+                    continue
+                if remaining_images:
+                    filtered_content.append(part)
+                    remaining_images -= 1
+            prepared.append({**message, "content": list(reversed(filtered_content))})
+
+        return list(reversed(prepared))
 
     def copy_messages(self) -> list[Message]:
         return list(self._messages)

@@ -234,6 +234,8 @@ def _usage_summary(convo: Convo) -> dict[str, Any]:
         "prompt_tokens": usage.get("prompt_tokens"),
         "cached_tokens": details.get("cached_tokens"),
         "cache_creation_input_tokens": usage.get("cache_creation_input_tokens"),
+        "time_to_first_token": convo.last_timing.get("time_to_first_token"),
+        "total_seconds": convo.last_timing.get("total_seconds"),
     }
 
 
@@ -242,23 +244,77 @@ def _completion_error_mentions(error: Exception, *needles: str) -> bool:
     return any(needle.lower() in message for needle in needles)
 
 
-def _complete_json(convo: Convo, *, model: str | None, api_key: str | None) -> dict[str, Any]:
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_openai_model(model: str | None) -> bool:
+    if not model:
+        return True
+    return "/" not in model or model.startswith("openai/")
+
+
+def _model_speed_kwargs(model: str | None) -> dict[str, Any]:
+    if not _is_openai_model(model):
+        return {}
+
+    kwargs: dict[str, Any] = {
+        "reasoning_effort": os.getenv("MMFCUA_REASONING_EFFORT", "none"),
+        "verbosity": os.getenv("MMFCUA_VERBOSITY", "low"),
+    }
+    max_tokens = os.getenv("MMFCUA_MAX_COMPLETION_TOKENS", "800")
+    try:
+        kwargs["max_completion_tokens"] = max(1, int(max_tokens))
+    except ValueError:
+        kwargs["max_completion_tokens"] = 800
+    service_tier = os.getenv("OPENAI_SERVICE_TIER")
+    if service_tier:
+        kwargs["service_tier"] = service_tier
+    return kwargs
+
+
+def _complete_json(
+    convo: Convo,
+    *,
+    model: str | None,
+    api_key: str | None,
+    stream_prefix: str,
+) -> dict[str, Any]:
     cache_kwargs = _cache_kwargs()
+    speed_kwargs = _model_speed_kwargs(model)
     attempts = [
-        {"response_format": {"type": "json_object"}, **cache_kwargs},
-        {"response_format": {"type": "json_object"}},
-        cache_kwargs,
+        {"response_format": {"type": "json_object"}, **cache_kwargs, **speed_kwargs},
+        {"response_format": {"type": "json_object"}, **speed_kwargs},
+        {**cache_kwargs, **speed_kwargs},
+        speed_kwargs,
         {},
     ]
     last_error: Exception | None = None
     text = ""
     for kwargs in attempts:
         try:
-            text = convo.complete(model=model, api_key=api_key, **kwargs)
+            text = convo.complete(
+                model=model,
+                api_key=api_key,
+                stream_output=_env_bool("MMFCUA_STREAM_MODEL_OUTPUT", True),
+                stream_prefix=stream_prefix,
+                **kwargs,
+            )
             break
         except Exception as error:
             last_error = error
-            if not _completion_error_mentions(error, "response_format", "prompt_cache", "cache_retention"):
+            if not _completion_error_mentions(
+                error,
+                "response_format",
+                "prompt_cache",
+                "cache_retention",
+                "reasoning_effort",
+                "verbosity",
+                "service_tier",
+            ):
                 raise
     else:
         if last_error:
@@ -323,7 +379,12 @@ def run_agent_loop(
     for step in range(1, max_steps + 1):
         log(f"[step {step}] calling model={model!r}", enabled=verbose)
         try:
-            reply = _complete_json(convo, model=model, api_key=api_key)
+            reply = _complete_json(
+                convo,
+                model=model,
+                api_key=api_key,
+                stream_prefix=f"[step {step}] model stream: ",
+            )
         except Exception as error:
             log(f"[step {step}] model/parse error: {error}", enabled=verbose)
             log(f"[step {step}] capturing recovery observation", enabled=verbose)
