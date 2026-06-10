@@ -185,7 +185,7 @@ Create `.env`:
 
 ```env
 OPENAI_API_KEY=...
-LITELLM_MODEL=gpt-5.4-mini
+LITELLM_MODEL=gpt-5.5
 ```
 
 Run:
@@ -230,9 +230,9 @@ settings relevant to an experiment:
 
 ```env
 # Main and review models
-LITELLM_MODEL=gpt-5.4-mini
-MMFCUA_REVIEW_MODEL=gpt-5.4-mini
-MMFCUA_REASONING_EFFORT=none
+LITELLM_MODEL=gpt-5.5
+MMFCUA_REVIEW_MODEL=gpt-5.5
+MMFCUA_REASONING_EFFORT=medium
 MMFCUA_VERBOSITY=low
 MMFCUA_MAX_COMPLETION_TOKENS=800
 MMFCUA_STREAM_MODEL_OUTPUT=1
