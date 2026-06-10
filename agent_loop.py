@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,13 @@ from typing import Any
 from jinja2 import Template
 
 from conversation import Convo
+from memory import (
+    RunRecorder,
+    make_memory,
+    review_completed_run,
+    save_memory,
+    verification_passed,
+)
 from tools import mouse_position, run_actions_safe, screenshot, tools_json_for_prompt
 
 
@@ -24,6 +32,11 @@ class AgentLoopResult:
     steps: int
     final_reply: dict[str, Any]
     conversation: Convo
+    run_path: str | None = None
+    memory_path: str | None = None
+    memory_verified: bool | None = None
+    memory_review: dict[str, Any] | None = None
+    memory_error: str | None = None
 
 
 def log(message: str, *, enabled: bool = True) -> None:
@@ -31,8 +44,56 @@ def log(message: str, *, enabled: bool = True) -> None:
         print(message, flush=True)
 
 
+def _record_step(
+    recorder: RunRecorder | None,
+    record: dict[str, Any],
+    *,
+    verbose: bool,
+) -> str | None:
+    if recorder is None:
+        return None
+    try:
+        recorder.record_step(record)
+    except Exception as error:
+        log(f"[memory] failed to record step: {error}", enabled=verbose)
+        return str(error)
+    return None
+
+
+def _finish_run(
+    recorder: RunRecorder | None,
+    status: str,
+    *,
+    verbose: bool,
+    **details: Any,
+) -> None:
+    if recorder is None:
+        return
+    try:
+        recorder.finish(status, **details)
+    except Exception as error:
+        log(f"[memory] failed to finish run log: {error}", enabled=verbose)
+
+
+def _minimum_memory_confidence() -> float:
+    raw_value = os.getenv("MMFCUA_MEMORY_MIN_CONFIDENCE", "0.75")
+    try:
+        return max(0.0, min(1.0, float(raw_value)))
+    except ValueError:
+        return 0.75
+
+
+def _observation_settle_seconds() -> float:
+    raw_value = os.getenv("MMFCUA_OBSERVATION_SETTLE_SECONDS", "0.1")
+    try:
+        return max(0.0, float(raw_value))
+    except ValueError:
+        return 0.1
+
+
 def observe_screen() -> tuple[dict[str, Any], dict[str, Any], str | None]:
     error_parts = []
+    time.sleep(_observation_settle_seconds())
     try:
         shot = screenshot()
     except Exception as error:
@@ -214,8 +275,23 @@ def run_agent_loop(
     verbose: bool = True,
 ) -> AgentLoopResult:
     log(f"[agent] starting task: {task!r}", enabled=verbose)
+    recorder: RunRecorder | None = None
+    recorder_error: str | None = None
+    try:
+        recorder = RunRecorder(task)
+        log(f"[memory] incremental run log={recorder.path}", enabled=verbose)
+    except Exception as error:
+        recorder_error = str(error)
+        log(f"[memory] could not start run recorder: {error}", enabled=verbose)
+
     log("[observe] capturing initial screenshot and mouse position", enabled=verbose)
     first_shot, first_mouse, first_error = observe_screen()
+    if recorder is not None:
+        try:
+            recorder.record_initial_observation(first_shot, first_mouse, first_error)
+        except Exception as error:
+            recorder_error = str(error)
+            log(f"[memory] failed to record initial observation: {error}", enabled=verbose)
     if first_error:
         log(f"[observe] initial observation error: {first_error}", enabled=verbose)
     log(
@@ -252,6 +328,7 @@ def run_agent_loop(
             log(f"[step {step}] model/parse error: {error}", enabled=verbose)
             log(f"[step {step}] capturing recovery observation", enabled=verbose)
             shot, mouse, observe_error = observe_screen()
+            change = screenshot_change(previous_shot, shot)
             text = json.dumps(
                 {
                     "model_response_error": str(error),
@@ -265,6 +342,22 @@ def run_agent_loop(
             else:
                 convo.observe(text)
             last_reply = {"reason": "Invalid model response.", "actions": [], "done": False}
+            record_error = _record_step(
+                recorder,
+                {
+                    "step": step,
+                    "kind": "model_error",
+                    "model_error": str(error),
+                    "screen_before": previous_shot,
+                    "screen_after": shot,
+                    "screen_change": change,
+                    "mouse_after": mouse,
+                    "observation_error": observe_error,
+                },
+                verbose=verbose,
+            )
+            recorder_error = record_error or recorder_error
+            previous_shot = shot
             log(f"[step {step}] recovery observation appended, messages={len(convo)}", enabled=verbose)
             continue
 
@@ -277,8 +370,88 @@ def run_agent_loop(
         log(f"[step {step}] usage/cache: {json.dumps(_usage_summary(convo))}", enabled=verbose)
         log(f"[step {step}] parsed reply: {json.dumps(reply, ensure_ascii=False)}", enabled=verbose)
         if reply["done"]:
+            record_error = _record_step(
+                recorder,
+                {
+                    "step": step,
+                    "kind": "completion_claim",
+                    "reply": reply,
+                    "screen_before": previous_shot,
+                    "screen_after": previous_shot,
+                    "screen_change": {
+                        "changed": None,
+                        "mean_delta": None,
+                        "reason": "no action; agent claimed completion",
+                    },
+                },
+                verbose=verbose,
+            )
+            recorder_error = record_error or recorder_error
+
+            memory_path: str | None = None
+            memory_verified: bool | None = None
+            memory_review: dict[str, Any] | None = None
+            memory_error = recorder_error
+
+            if recorder is not None:
+                log("[memory] verifying and reflecting on completed run", enabled=verbose)
+                try:
+                    memory_review = review_completed_run(
+                        task=task,
+                        trajectory=recorder.trajectory,
+                        final_reply=reply,
+                        final_screenshot=previous_shot,
+                        model=model,
+                        api_key=api_key,
+                    )
+                    memory_verified = verification_passed(
+                        memory_review,
+                        minimum_confidence=_minimum_memory_confidence(),
+                    )
+                    verification = memory_review["verification"]
+                    log(
+                        "[memory] verification "
+                        f"success={verification['success']} "
+                        f"confidence={verification['confidence']}",
+                        enabled=verbose,
+                    )
+                    if memory_verified:
+                        saved_path = save_memory(
+                            make_memory(
+                                recorder=recorder,
+                                review=memory_review,
+                            )
+                        )
+                        memory_path = str(saved_path)
+                        log(f"[memory] saved reusable memory={memory_path}", enabled=verbose)
+                    else:
+                        log("[memory] verification rejected; reusable memory not saved", enabled=verbose)
+                except Exception as error:
+                    memory_error = str(error)
+                    log(f"[memory] post-task review failed: {error}", enabled=verbose)
+
+            finish_status = "memory_saved" if memory_path else "completed_without_memory"
+            _finish_run(
+                recorder,
+                finish_status,
+                verbose=verbose,
+                agent_done=True,
+                memory_verified=memory_verified,
+                memory_path=memory_path,
+                memory_error=memory_error,
+            )
             log(f"[agent] task complete at step {step}", enabled=verbose)
-            return AgentLoopResult(done=True, steps=step, final_reply=reply, conversation=convo)
+            return AgentLoopResult(
+                done=True,
+                steps=step,
+                final_reply=reply,
+                conversation=convo,
+                run_path=str(recorder.path) if recorder else None,
+                memory_path=memory_path,
+                memory_verified=memory_verified,
+                memory_review=memory_review,
+                memory_error=memory_error,
+            )
 
         log(f"[step {step}] executing actions: {json.dumps(reply['actions'], ensure_ascii=False)}", enabled=verbose)
         tool_results = run_actions_safe(reply["actions"])
@@ -316,8 +489,43 @@ def run_agent_loop(
             convo.observe(observation_text, screenshot=shot)
         else:
             convo.observe(observation_text)
+        record_error = _record_step(
+            recorder,
+            {
+                "step": step,
+                "kind": "action",
+                "reply": reply,
+                "actions": reply["actions"],
+                "tool_results": tool_results,
+                "screen_before": previous_shot,
+                "screen_after": shot,
+                "screen_change": change,
+                "mouse_after": mouse,
+                "observation_error": observe_error,
+                "coordinate_policy": (
+                    "Coordinates are historical hints only; relocate semantic "
+                    "targets from the current screenshot before reuse."
+                ),
+            },
+            verbose=verbose,
+        )
+        recorder_error = record_error or recorder_error
         log(f"[conversation] post-action observation appended, messages={len(convo)}", enabled=verbose)
         previous_shot = shot
 
     log(f"[agent] stopped after max_steps={max_steps}, done=False", enabled=verbose)
-    return AgentLoopResult(done=False, steps=max_steps, final_reply=last_reply, conversation=convo)
+    _finish_run(
+        recorder,
+        "max_steps_reached",
+        verbose=verbose,
+        agent_done=False,
+        memory_error=recorder_error,
+    )
+    return AgentLoopResult(
+        done=False,
+        steps=max_steps,
+        final_reply=last_reply,
+        conversation=convo,
+        run_path=str(recorder.path) if recorder else None,
+        memory_error=recorder_error,
+    )

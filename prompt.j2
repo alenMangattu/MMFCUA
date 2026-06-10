@@ -111,10 +111,6 @@ Example stacked command with wait:
     "arguments": {
       "key": "Enter"
     }
-  },
-  {
-    "tool": "screenshot",
-    "arguments": {}
   }
 ]
 ```
@@ -150,10 +146,6 @@ Other valid primitive actions:
     "arguments": {
       "seconds": 0.5
     }
-  },
-  {
-    "tool": "screenshot",
-    "arguments": {}
   }
 ]
 ```
@@ -252,6 +244,8 @@ Rules:
 - You are an iterative computer-use agent. You do not need to finish everything
   in one response. Act, get the next screenshot/tool result, analyze the new
   state, then act again until the small task is complete.
+- Do not request a screenshot action. After every action batch, the loop waits
+  briefly and automatically captures the next screenshot for you.
 - A tool result with `"ok": true` only means the OS accepted the input command.
   It does not mean the UI changed or the task succeeded. Trust the next
   screenshot and `screen_change` observation more than the tool result.

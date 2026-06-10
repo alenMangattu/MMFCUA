@@ -23,6 +23,13 @@ def main() -> None:
     result = run_agent_loop(text, model=model, api_key=api_key, verbose=True)
     print(f"[main] final done={result.done} steps={result.steps}", flush=True)
     print(f"[main] final reply={result.final_reply}", flush=True)
+    print(f"[main] run log={result.run_path}", flush=True)
+    print(
+        f"[main] memory verified={result.memory_verified} path={result.memory_path}",
+        flush=True,
+    )
+    if result.memory_error:
+        print(f"[main] memory error={result.memory_error}", flush=True)
 
 
 if __name__ == "__main__":

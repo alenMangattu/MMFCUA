@@ -440,7 +440,13 @@ def tools_json() -> list[dict[str, Any]]:
 
 
 def tools_json_for_prompt(indent: int = 2) -> str:
-    return json.dumps(tools_json(), indent=indent)
+    automatic_observation_tools = {"screenshot", "mouse_position", "screen_size"}
+    prompt_tools = [
+        entry.to_json()
+        for entry in TOOLS
+        if entry.name not in automatic_observation_tools
+    ]
+    return json.dumps(prompt_tools, indent=indent)
 
 
 def call_tool(name: str, arguments: dict[str, Any] | None = None) -> Any:
